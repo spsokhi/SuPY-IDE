@@ -42,13 +42,13 @@ Install Dependencies
 ```
 pip install PyQt5
 pip install pyinstaller
-
+```
 
 ### Run the IDE
 Once the environment is set up, you can run the IDE:
 ```
 python ide.py
-
+```
 ### Contributing
 Feel free to fork this project and submit pull requests. Contributions are welcome!
 
@@ -61,4 +61,4 @@ This project is licensed under the MIT License.
 3. **Packaging**: Instructions on how to create a standalone executable.
 4. **Contributing and License**: General information on contributing and the project license.
 
-You can replace `https://github.com/spsokhi/SuPY-IDE.git` 
+`https://github.com/spsokhi/SuPY-IDE.git` 
