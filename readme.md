@@ -12,8 +12,13 @@ code runner.
 ## ✨ Features
 
 ### Editor
+- **Tabbed multi-file editing** — open and edit several files at once; unsaved
+  tabs are marked with a `*` and prompt before closing.
 - **Syntax highlighting** — keywords, builtins, numbers, decorators, `def`/`class`
   names, `self`/`cls`, and strings (including multi-line triple-quoted strings).
+- **Live syntax checking** — your code is parsed with Python's `ast` as you type
+  and the offending line is underlined, with the error shown in the status bar —
+  no need to run the code first.
 - **Smart editing**
   - Auto-indentation (keeps indent, adds one level after `:`).
   - `Tab` inserts 4 spaces; `Tab`/`Shift+Tab` indent/dedent whole selections.
@@ -36,9 +41,12 @@ code runner.
 
 ### Workflow & UI
 - **Light / dark themes** (`Ctrl+T`).
-- Menu bar, toolbar and status bar (cursor position, run status).
-- File handling with **modified-state tracking** (a `*` in the title) and
-  **unsaved-changes prompts** when you open/new/close.
+- **Recent-files menu** (`File ▸ Open Recent`).
+- **Persistent settings** — your theme, zoom level and window size are
+  remembered between sessions.
+- Menu bar, toolbar and status bar (live syntax status, cursor position, run status).
+- File handling with **modified-state tracking** (a `*` on the tab/title) and
+  **unsaved-changes prompts** when you close a tab or the app.
 - Resizable editor / output split.
 
 ---
@@ -51,9 +59,9 @@ code runner.
 | Open file         | `Ctrl+O`        | Stop run          | `Shift+F5`      |
 | Save              | `Ctrl+S`        | Clear output      | `Ctrl+L`        |
 | Save As           | `Ctrl+Shift+S`  | Toggle comment    | `Ctrl+/`        |
-| Find / Replace    | `Ctrl+F` / `Ctrl+H` | Toggle theme  | `Ctrl+T`        |
-| Zoom in / out     | `Ctrl+=` / `Ctrl+-` | Reset zoom    | `Ctrl+0`        |
-| Quit              | `Ctrl+Q`        |                   |                 |
+| Close tab         | `Ctrl+W`        | Toggle theme      | `Ctrl+T`        |
+| Find / Replace    | `Ctrl+F` / `Ctrl+H` | Zoom in / out | `Ctrl+=` / `Ctrl+-` |
+| Reset zoom        | `Ctrl+0`        | Quit              | `Ctrl+Q`        |
 
 ---
 
@@ -113,6 +121,24 @@ SuPY-IDE/
 ├── .gitignore
 └── readme.md
 ```
+
+---
+
+## 🗺️ Roadmap
+
+Planned / possible future upgrades:
+
+- **Smart autocomplete** via [Jedi](https://github.com/davidhalter/jedi) —
+  context-aware completions, hover docs and go-to-definition.
+- **One-key code formatting** (`black` / `autopep8`).
+- **Project / file-tree panel** to open a whole folder.
+- **Run configurations** — CLI arguments, interpreter / virtual-env selection.
+- **Integrated REPL / terminal** panel.
+- **Editor niceties** — Go to Line, bracket matching, code folding, indent guides.
+
+> As these land, `ide.py` will likely be split into a small package
+> (`editor.py`, `highlighter.py`, `runner.py`, `mainwindow.py`). For now the
+> single-file layout is intentional.
 
 ---
 

@@ -4,8 +4,11 @@ SuPY-IDE — a lightweight, single-file Python IDE built with PyQt5.
 
 Features
 --------
+* Tabbed multi-file editing.
 * Syntax highlighting (keywords, builtins, strings incl. triple-quoted,
   numbers, comments, decorators, def/class names, ``self``).
+* Live syntax checking (``ast``) — errors are underlined as you type, with no
+  need to run the code.
 * Smart editor: auto-indentation, tab-to-spaces, bracket/quote auto-closing,
   comment toggling and smart backspace.
 * Autocompletion for Python keywords and builtins.
@@ -15,21 +18,23 @@ Features
 * Error lines are highlighted from the traceback.
 * Find & Replace bar (Ctrl+F / Ctrl+H) with wrap-around search.
 * Light / dark themes, editor zoom, line numbers with current-line gutter.
+* Recent-files menu and persistent settings (theme, zoom, window size).
 * File handling with modified-state tracking and unsaved-changes prompts.
 
 Made with care by Sukhpreet Singh.
 """
 
-import sys
 import os
 import re
+import sys
+import ast
 import time
 import shutil
 import keyword
 import builtins
 import tempfile
 
-from PyQt5.QtCore import Qt, QRect, QSize, QProcess
+from PyQt5.QtCore import Qt, QRect, QSize, QProcess, QTimer, QSettings
 from PyQt5.QtGui import (
     QColor, QTextCharFormat, QSyntaxHighlighter, QFont, QPainter,
     QTextCursor, QTextFormat, QTextDocument, QFontMetricsF, QKeySequence,
@@ -37,8 +42,12 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QTextEdit, QPushButton, QFileDialog,
     QPlainTextEdit, QCompleter, QLabel, QMainWindow, QAction, QToolBar,
-    QStatusBar, QSplitter, QLineEdit, QMessageBox, QVBoxLayout,
+    QStatusBar, QSplitter, QLineEdit, QMessageBox, QVBoxLayout, QTabWidget,
 )
+
+APP_ORG = "SuPY-IDE"
+APP_NAME = "SuPY-IDE"
+MAX_RECENT = 10
 
 # --------------------------------------------------------------------------- #
 #  Themes
@@ -57,6 +66,7 @@ THEMES = {
         "output_bg": "#181a1b",
         "output_fg": "#d4d4d4",
         "error_text": "#f48771",
+        "ok_text": "#6a9955",
         "input_echo": "#6a9955",
         "syntax": {
             "keyword": "#569cd6",
@@ -82,6 +92,7 @@ THEMES = {
         "output_bg": "#fafafa",
         "output_fg": "#1f1f1f",
         "error_text": "#c0392b",
+        "ok_text": "#107c10",
         "input_echo": "#107c10",
         "syntax": {
             "keyword": "#0000ff",
@@ -229,20 +240,26 @@ class LineNumberArea(QWidget):
 # --------------------------------------------------------------------------- #
 
 class CodeEditor(QPlainTextEdit):
-    """Plain-text editor with line numbers, smart editing and completion."""
+    """Plain-text editor with line numbers, smart editing and completion.
 
-    def __init__(self, theme="dark"):
+    Each editor owns its file path, its highlighter and its error state, so it
+    can live independently inside a tab.
+    """
+
+    def __init__(self, theme="dark", font_size=11):
         super().__init__()
         self._palette = THEMES[theme]
-        self.error_lines = set()
+        self.file_path = None
+        self.error_lines = set()        # runtime traceback lines
+        self.syntax_error = None        # (line, message) from live linting
 
         self.line_number_area = LineNumberArea(self)
+        self.highlighter = PythonHighlighter(self.document(), theme)
 
         font = QFont("Consolas")
         font.setStyleHint(QFont.Monospace)
         font.setFixedPitch(True)
-        font.setPointSize(11)
-        self._base_font = font
+        font.setPointSize(font_size)
         self.setFont(font)
         self._apply_tab_width()
 
@@ -287,6 +304,7 @@ class CodeEditor(QPlainTextEdit):
 
     def set_theme(self, theme):
         self._palette = THEMES[theme]
+        self.highlighter.set_theme(theme)
         self.update_extra_selections()
         self.line_number_area.update()
 
@@ -294,13 +312,10 @@ class CodeEditor(QPlainTextEdit):
         metrics = QFontMetricsF(self.font())
         self.setTabStopDistance(4 * metrics.horizontalAdvance(" "))
 
-    def zoom(self, delta):
-        if delta > 0:
-            self.zoomIn(1)
-        elif delta < 0:
-            self.zoomOut(1)
-        else:  # reset
-            self.setFont(self._base_font)
+    def set_font_size(self, point_size):
+        font = self.font()
+        font.setPointSize(point_size)
+        self.setFont(font)
         self._apply_tab_width()
         self.update_line_number_area_width(0)
 
@@ -352,7 +367,7 @@ class CodeEditor(QPlainTextEdit):
             bottom = top + int(self.blockBoundingRect(block).height())
             block_number += 1
 
-    # -- selections (current line + error lines) --------------------------- #
+    # -- selections (current line + runtime/syntax errors) ----------------- #
 
     def clear_error_lines(self):
         if self.error_lines:
@@ -363,9 +378,19 @@ class CodeEditor(QPlainTextEdit):
         self.error_lines = {n for n in lines if 1 <= n <= self.blockCount()}
         self.update_extra_selections()
 
+    def set_syntax_error(self, line, message):
+        self.syntax_error = (line, message)
+        self.update_extra_selections()
+
+    def clear_syntax_error(self):
+        if self.syntax_error:
+            self.syntax_error = None
+            self.update_extra_selections()
+
     def update_extra_selections(self):
         selections = []
 
+        # Runtime error lines — full-width background.
         for line in self.error_lines:
             block = self.document().findBlockByNumber(line - 1)
             if not block.isValid():
@@ -377,6 +402,7 @@ class CodeEditor(QPlainTextEdit):
             selection.cursor.clearSelection()
             selections.append(selection)
 
+        # Current line — full-width background.
         if not self.isReadOnly():
             selection = QTextEdit.ExtraSelection()
             selection.format.setBackground(QColor(self._palette["current_line"]))
@@ -384,6 +410,19 @@ class CodeEditor(QPlainTextEdit):
             selection.cursor = self.textCursor()
             selection.cursor.clearSelection()
             selections.append(selection)
+
+        # Live syntax error — wavy underline under the offending line.
+        if self.syntax_error:
+            line = self.syntax_error[0]
+            block = self.document().findBlockByNumber(line - 1)
+            if block.isValid():
+                selection = QTextEdit.ExtraSelection()
+                selection.format.setUnderlineStyle(QTextCharFormat.WaveUnderline)
+                selection.format.setUnderlineColor(QColor(self._palette["error_text"]))
+                cursor = QTextCursor(block)
+                cursor.select(QTextCursor.LineUnderCursor)
+                selection.cursor = cursor
+                selections.append(selection)
 
         self.setExtraSelections(selections)
 
@@ -422,8 +461,7 @@ class CodeEditor(QPlainTextEdit):
             line_cursor = QTextCursor(block)
             if dedent:
                 text = block.text()
-                remove = len(text) - len(text.lstrip(" "))
-                remove = min(remove, 4)
+                remove = min(len(text) - len(text.lstrip(" ")), 4)
                 for _ in range(remove):
                     line_cursor.deleteChar()
             else:
@@ -557,9 +595,11 @@ class CodeEditor(QPlainTextEdit):
 # --------------------------------------------------------------------------- #
 
 class FindReplaceBar(QWidget):
-    def __init__(self, editor):
+    """Search bar that always operates on the currently active editor."""
+
+    def __init__(self, get_editor):
         super().__init__()
-        self.editor = editor
+        self._get_editor = get_editor
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
@@ -588,8 +628,15 @@ class FindReplaceBar(QWidget):
         close_btn.clicked.connect(self.hide)
         self.hide()
 
+    @property
+    def editor(self):
+        return self._get_editor()
+
     def open(self):
-        cursor = self.editor.textCursor()
+        editor = self.editor
+        if editor is None:
+            return
+        cursor = editor.textCursor()
         if cursor.hasSelection():
             self.find_field.setText(cursor.selectedText())
         self.show()
@@ -597,19 +644,19 @@ class FindReplaceBar(QWidget):
         self.find_field.selectAll()
 
     def _find(self, backward=False):
+        editor = self.editor
         text = self.find_field.text()
-        if not text:
+        if editor is None or not text:
             return False
         flags = QTextDocument.FindFlags()
         if backward:
             flags |= QTextDocument.FindBackward
-        if self.editor.find(text, flags):
+        if editor.find(text, flags):
             return True
-        # Wrap around.
-        cursor = self.editor.textCursor()
+        cursor = editor.textCursor()
         cursor.movePosition(QTextCursor.End if backward else QTextCursor.Start)
-        self.editor.setTextCursor(cursor)
-        return self.editor.find(text, flags)
+        editor.setTextCursor(cursor)
+        return editor.find(text, flags)
 
     def find_next(self):
         self._find(backward=False)
@@ -618,22 +665,26 @@ class FindReplaceBar(QWidget):
         self._find(backward=True)
 
     def replace_one(self):
-        cursor = self.editor.textCursor()
+        editor = self.editor
+        if editor is None:
+            return
+        cursor = editor.textCursor()
         if cursor.hasSelection() and cursor.selectedText() == self.find_field.text():
             cursor.insertText(self.replace_field.text())
         self.find_next()
 
     def replace_all(self):
+        editor = self.editor
         text = self.find_field.text()
-        if not text:
+        if editor is None or not text:
             return
-        cursor = self.editor.textCursor()
+        cursor = editor.textCursor()
         cursor.beginEditBlock()
         cursor.movePosition(QTextCursor.Start)
-        self.editor.setTextCursor(cursor)
+        editor.setTextCursor(cursor)
         count = 0
-        while self.editor.find(text):
-            self.editor.textCursor().insertText(self.replace_field.text())
+        while editor.find(text):
+            editor.textCursor().insertText(self.replace_field.text())
             count += 1
         cursor.endEditBlock()
         self.window().statusBar().showMessage(f"Replaced {count} occurrence(s).", 4000)
@@ -641,7 +692,8 @@ class FindReplaceBar(QWidget):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.hide()
-            self.editor.setFocus()
+            if self.editor is not None:
+                self.editor.setFocus()
         else:
             super().keyPressEvent(event)
 
@@ -653,33 +705,51 @@ class FindReplaceBar(QWidget):
 class SuPYIDE(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.current_theme = "dark"
-        self.current_file = None
+        self.settings = QSettings(APP_ORG, APP_NAME)
+        self.current_theme = self.settings.value("theme", "dark")
+        if self.current_theme not in THEMES:
+            self.current_theme = "dark"
+        self.font_size = int(self.settings.value("font_size", 11))
+        self.recent_files = self._load_recent()
+
         self.process = None
+        self._run_editor = None
         self._temp_path = None
         self._stderr_buffer = ""
         self._start_time = 0.0
+
         self.init_ui()
         self.apply_theme(self.current_theme)
-        self.update_title()
+
+        # Restore window geometry, or fall back to a sensible default.
+        geometry = self.settings.value("geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        else:
+            self.setGeometry(100, 100, 1100, 760)
+
+        self.new_file()  # start with one empty tab
+        self._rebuild_recent_menu()
 
     # -- UI construction --------------------------------------------------- #
 
     def init_ui(self):
-        self.setGeometry(100, 100, 1100, 760)
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
-        self.editor = CodeEditor(self.current_theme)
-        self.editor.setPlaceholderText("Write your Python code here…  (F5 to run)")
-        self.highlighter = PythonHighlighter(self.editor.document(), self.current_theme)
-        self.editor.textChanged.connect(self._on_text_changed)
-        self.editor.cursorPositionChanged.connect(self._update_position)
-
-        self.find_bar = FindReplaceBar(self.editor)
+        self.find_bar = FindReplaceBar(self.current_editor)
 
         self.output_area = QPlainTextEdit()
         self.output_area.setReadOnly(True)
         self.output_area.setPlaceholderText("Program output will appear here…")
-        self.output_area.setFont(self.editor.font())
+        out_font = QFont("Consolas")
+        out_font.setStyleHint(QFont.Monospace)
+        out_font.setPointSize(self.font_size)
+        self.output_area.setFont(out_font)
 
         self.input_line = QLineEdit()
         self.input_line.setPlaceholderText("Program input (stdin) — type and press Enter while running")
@@ -691,7 +761,7 @@ class SuPYIDE(QMainWindow):
         editor_layout.setContentsMargins(0, 0, 0, 0)
         editor_layout.setSpacing(0)
         editor_layout.addWidget(self.find_bar)
-        editor_layout.addWidget(self.editor)
+        editor_layout.addWidget(self.tabs)
 
         output_panel = QWidget()
         output_layout = QVBoxLayout(output_panel)
@@ -707,6 +777,12 @@ class SuPYIDE(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([520, 220])
         self.setCentralWidget(splitter)
+
+        # Debounced live syntax checker.
+        self.lint_timer = QTimer(self)
+        self.lint_timer.setSingleShot(True)
+        self.lint_timer.setInterval(400)
+        self.lint_timer.timeout.connect(self._run_lint)
 
         self._build_actions()
         self._build_toolbar()
@@ -726,16 +802,18 @@ class SuPYIDE(QMainWindow):
         self.act_open = action("Open…", "Ctrl+O", self.open_file)
         self.act_save = action("Save", "Ctrl+S", self.save_file)
         self.act_save_as = action("Save As…", "Ctrl+Shift+S", self.save_file_as)
+        self.act_close_tab = action("Close Tab", "Ctrl+W", self.close_current_tab)
         self.act_run = action("Run", "F5", self.run_code)
         self.act_stop = action("Stop", "Shift+F5", self.stop_code)
         self.act_stop.setEnabled(False)
         self.act_clear = action("Clear Output", "Ctrl+L", self.clear_output)
         self.act_find = action("Find / Replace…", "Ctrl+F", self.find_bar.open)
         self.act_replace = action("Replace…", "Ctrl+H", self.find_bar.open)
-        self.act_comment = action("Toggle Comment", "Ctrl+/", self.editor.toggle_comment)
-        self.act_zoom_in = action("Zoom In", "Ctrl+=", lambda: self.editor.zoom(1))
-        self.act_zoom_out = action("Zoom Out", "Ctrl+-", lambda: self.editor.zoom(-1))
-        self.act_zoom_reset = action("Reset Zoom", "Ctrl+0", lambda: self.editor.zoom(0))
+        self.act_comment = action("Toggle Comment", "Ctrl+/",
+                                  lambda: self._with_editor(lambda e: e.toggle_comment()))
+        self.act_zoom_in = action("Zoom In", "Ctrl+=", lambda: self.change_zoom(1))
+        self.act_zoom_out = action("Zoom Out", "Ctrl+-", lambda: self.change_zoom(-1))
+        self.act_zoom_reset = action("Reset Zoom", "Ctrl+0", lambda: self.change_zoom(0))
         self.act_theme = action("Toggle Theme", "Ctrl+T", self.toggle_theme)
         self.act_about = action("About", None, self.show_about)
         self.act_quit = action("Quit", "Ctrl+Q", self.close)
@@ -756,8 +834,13 @@ class SuPYIDE(QMainWindow):
     def _build_menu(self):
         bar = self.menuBar()
         file_menu = bar.addMenu("&File")
-        for act in (self.act_new, self.act_open, self.act_save, self.act_save_as):
-            file_menu.addAction(act)
+        file_menu.addAction(self.act_new)
+        file_menu.addAction(self.act_open)
+        self.recent_menu = file_menu.addMenu("Open &Recent")
+        file_menu.addSeparator()
+        file_menu.addAction(self.act_save)
+        file_menu.addAction(self.act_save_as)
+        file_menu.addAction(self.act_close_tab)
         file_menu.addSeparator()
         file_menu.addAction(self.act_quit)
 
@@ -779,26 +862,120 @@ class SuPYIDE(QMainWindow):
 
     def _build_statusbar(self):
         self.setStatusBar(QStatusBar())
+        self.lint_label = QLabel("Ready")
         self.position_label = QLabel("Ln 1, Col 1")
         self.exec_label = QLabel("Ready")
+        self.statusBar().addPermanentWidget(self.lint_label)
         self.statusBar().addPermanentWidget(self.position_label)
         self.statusBar().addPermanentWidget(self.exec_label)
 
-    # -- title / status helpers ------------------------------------------- #
+    # -- tab / editor helpers ---------------------------------------------- #
+
+    def current_editor(self):
+        return self.tabs.currentWidget()
+
+    def _with_editor(self, func):
+        editor = self.current_editor()
+        if editor is not None:
+            func(editor)
+
+    def _new_tab(self, path=None, content=""):
+        editor = CodeEditor(self.current_theme, self.font_size)
+        editor.file_path = path
+        editor.setPlaceholderText("Write your Python code here…  (F5 to run)")
+        editor.setPlainText(content)
+        editor.document().setModified(False)
+        editor.textChanged.connect(lambda e=editor: self._on_text_changed(e))
+        editor.cursorPositionChanged.connect(self._update_position)
+        index = self.tabs.addTab(editor, self._tab_label(editor))
+        self.tabs.setCurrentIndex(index)
+        editor.setFocus()
+        return editor
+
+    def _tab_label(self, editor):
+        name = os.path.basename(editor.file_path) if editor.file_path else "Untitled"
+        return name + ("*" if editor.document().isModified() else "")
+
+    def _refresh_tab_label(self, editor):
+        index = self.tabs.indexOf(editor)
+        if index != -1:
+            self.tabs.setTabText(index, self._tab_label(editor))
+        if editor is self.current_editor():
+            self.update_title()
+
+    def _find_tab_by_path(self, path):
+        target = os.path.normcase(os.path.abspath(path))
+        for i in range(self.tabs.count()):
+            editor = self.tabs.widget(i)
+            if editor.file_path and os.path.normcase(os.path.abspath(editor.file_path)) == target:
+                return i
+        return -1
 
     def update_title(self):
-        name = os.path.basename(self.current_file) if self.current_file else "Untitled"
-        star = "*" if self.editor.document().isModified() else ""
+        editor = self.current_editor()
+        if editor is None:
+            self.setWindowTitle("SuPY-IDE")
+            return
+        name = os.path.basename(editor.file_path) if editor.file_path else "Untitled"
+        star = "*" if editor.document().isModified() else ""
         self.setWindowTitle(f"{name}{star} — SuPY-IDE")
 
-    def _on_text_changed(self):
-        self.editor.clear_error_lines()
+    def _on_text_changed(self, editor):
+        editor.clear_error_lines()
+        self._refresh_tab_label(editor)
+        if editor is self.current_editor():
+            self.lint_timer.start()
+
+    def _on_tab_changed(self, _index):
         self.update_title()
+        self._update_position()
+        self._run_lint()
 
     def _update_position(self):
-        cursor = self.editor.textCursor()
+        editor = self.current_editor()
+        if editor is None:
+            return
+        cursor = editor.textCursor()
         self.position_label.setText(
             f"Ln {cursor.blockNumber() + 1}, Col {cursor.positionInBlock() + 1}")
+
+    # -- live syntax checking ---------------------------------------------- #
+
+    def _run_lint(self):
+        editor = self.current_editor()
+        if editor is None:
+            return
+        text = editor.toPlainText()
+        if not text.strip():
+            editor.clear_syntax_error()
+            self._set_lint_status("ready")
+            return
+        try:
+            ast.parse(text)
+        except SyntaxError as error:
+            line = error.lineno or 1
+            message = error.msg or "invalid syntax"
+            editor.set_syntax_error(line, message)
+            self._set_lint_status("error", f"Line {line}: {message}")
+            return
+        except Exception:
+            editor.clear_syntax_error()
+            self._set_lint_status("ready")
+            return
+        editor.clear_syntax_error()
+        self._set_lint_status("ok")
+
+    def _set_lint_status(self, state, message=""):
+        palette = THEMES[self.current_theme]
+        if state == "ok":
+            self.lint_label.setText("✓ No errors")
+            self.lint_label.setStyleSheet(f"color: {palette['ok_text']};")
+        elif state == "error":
+            self.lint_label.setText(f"● {message}")
+            self.lint_label.setStyleSheet(f"color: {palette['error_text']};")
+        else:
+            self.lint_label.setText("Ready")
+            self.lint_label.setStyleSheet(f"color: {palette['gutter_fg']};")
 
     # -- theming ----------------------------------------------------------- #
 
@@ -808,8 +985,8 @@ class SuPYIDE(QMainWindow):
 
     def apply_theme(self, theme):
         palette = THEMES[theme]
-        self.editor.set_theme(theme)
-        self.highlighter.set_theme(theme)
+        for i in range(self.tabs.count()):
+            self.tabs.widget(i).set_theme(theme)
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{ background-color: {palette['window']};
                                     color: {palette['editor_fg']}; }}
@@ -829,9 +1006,27 @@ class SuPYIDE(QMainWindow):
             QMenuBar::item:selected, QMenu::item:selected {{ background-color: #3a6ea5; }}
             QStatusBar {{ background-color: {palette['gutter_bg']};
                           color: {palette['editor_fg']}; }}
+            QTabWidget::pane {{ border: none; }}
+            QTabBar::tab {{ background: {palette['gutter_bg']}; color: {palette['editor_fg']};
+                            padding: 5px 12px; border: none; }}
+            QTabBar::tab:selected {{ background: {palette['editor_bg']}; }}
         """)
         self.output_area.setStyleSheet(
             f"background-color: {palette['output_bg']}; color: {palette['output_fg']}; border: none;")
+        self._run_lint()
+
+    # -- zoom -------------------------------------------------------------- #
+
+    def change_zoom(self, delta):
+        if delta == 0:
+            self.font_size = 11
+        else:
+            self.font_size = max(6, min(40, self.font_size + delta))
+        for i in range(self.tabs.count()):
+            self.tabs.widget(i).set_font_size(self.font_size)
+        out_font = self.output_area.font()
+        out_font.setPointSize(self.font_size)
+        self.output_area.setFont(out_font)
 
     # -- output helpers ---------------------------------------------------- #
 
@@ -848,20 +1043,24 @@ class SuPYIDE(QMainWindow):
     def clear_output(self):
         self.output_area.clear()
         self.exec_label.setText("Ready")
-        self.editor.clear_error_lines()
+        self._with_editor(lambda e: e.clear_error_lines())
 
     # -- running code ------------------------------------------------------ #
 
     def run_code(self):
         if self.process and self.process.state() != QProcess.NotRunning:
             return
-        code = self.editor.toPlainText()
+        editor = self.current_editor()
+        if editor is None:
+            return
+        code = editor.toPlainText()
         if not code.strip():
             self.statusBar().showMessage("Nothing to run.", 3000)
             return
 
         self.output_area.clear()
-        self.editor.clear_error_lines()
+        editor.clear_error_lines()
+        self._run_editor = editor
         self._cleanup_temp()
 
         fd, path = tempfile.mkstemp(suffix=".py", prefix="supy_")
@@ -889,7 +1088,7 @@ class SuPYIDE(QMainWindow):
 
     def _on_stdout(self):
         data = bytes(self.process.readAllStandardOutput()).decode("utf-8", "replace")
-        self.append_output(data, self.output_area.palette().text().color().name())
+        self.append_output(data, THEMES[self.current_theme]["output_fg"])
 
     def _on_stderr(self):
         data = bytes(self.process.readAllStandardError()).decode("utf-8", "replace")
@@ -908,14 +1107,14 @@ class SuPYIDE(QMainWindow):
         self.process = None
 
     def _highlight_error_line(self):
-        if not self._temp_path:
+        if not self._temp_path or self._run_editor is None:
             return
         name = os.path.basename(self._temp_path)
         lines = [int(m.group(2))
                  for m in re.finditer(r'File "([^"]+)", line (\d+)', self._stderr_buffer)
                  if os.path.basename(m.group(1)) == name]
         if lines:
-            self.editor.set_error_lines([lines[-1]])
+            self._run_editor.set_error_lines([lines[-1]])
 
     def stop_code(self):
         if self.process and self.process.state() != QProcess.NotRunning:
@@ -940,53 +1139,137 @@ class SuPYIDE(QMainWindow):
 
     # -- file handling ----------------------------------------------------- #
 
-    def _maybe_save(self):
-        if not self.editor.document().isModified():
+    def _maybe_save(self, editor):
+        if not editor.document().isModified():
             return True
+        self.tabs.setCurrentWidget(editor)
         choice = QMessageBox.question(
             self, "Unsaved changes",
-            "You have unsaved changes. Save before continuing?",
+            f"Save changes to {self._tab_label(editor).rstrip('*')}?",
             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         if choice == QMessageBox.Save:
             return self.save_file()
         return choice == QMessageBox.Discard
 
     def new_file(self):
-        if not self._maybe_save():
-            return
-        self.editor.clear()
-        self.current_file = None
-        self.editor.document().setModified(False)
+        self._new_tab()
         self.update_title()
 
     def open_file(self):
-        if not self._maybe_save():
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Code", "", "Python Files (*.py);;All Files (*)")
+        if path:
+            self._open_path(path)
+
+    def _open_path(self, path):
+        existing = self._find_tab_by_path(path)
+        if existing != -1:
+            self.tabs.setCurrentIndex(existing)
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open Code", "", "Python Files (*.py);;All Files (*)")
-        if not path:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+        except OSError as error:
+            QMessageBox.warning(self, "Open failed", f"Could not open file:\n{error}")
+            self._remove_recent(path)
             return
-        with open(path, "r", encoding="utf-8") as handle:
-            self.editor.setPlainText(handle.read())
-        self.current_file = path
-        self.editor.document().setModified(False)
+        editor = self.current_editor()
+        # Reuse a single pristine "Untitled" tab if present.
+        if (editor is not None and editor.file_path is None
+                and not editor.document().isModified() and not editor.toPlainText()):
+            editor.file_path = path
+            editor.setPlainText(content)
+            editor.document().setModified(False)
+            self._refresh_tab_label(editor)
+        else:
+            self._new_tab(path, content)
+        self._add_recent(path)
         self.update_title()
+        self._run_lint()
 
     def save_file(self):
-        if not self.current_file:
+        editor = self.current_editor()
+        if editor is None:
+            return False
+        if not editor.file_path:
             return self.save_file_as()
-        with open(self.current_file, "w", encoding="utf-8") as handle:
-            handle.write(self.editor.toPlainText())
-        self.editor.document().setModified(False)
-        self.update_title()
-        self.statusBar().showMessage(f"Saved {self.current_file}", 3000)
+        try:
+            with open(editor.file_path, "w", encoding="utf-8") as handle:
+                handle.write(editor.toPlainText())
+        except OSError as error:
+            QMessageBox.warning(self, "Save failed", f"Could not save file:\n{error}")
+            return False
+        editor.document().setModified(False)
+        self._refresh_tab_label(editor)
+        self._add_recent(editor.file_path)
+        self.statusBar().showMessage(f"Saved {editor.file_path}", 3000)
         return True
 
     def save_file_as(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Code", "", "Python Files (*.py);;All Files (*)")
+        editor = self.current_editor()
+        if editor is None:
+            return False
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Code", "", "Python Files (*.py);;All Files (*)")
         if not path:
             return False
-        self.current_file = path
+        editor.file_path = path
         return self.save_file()
+
+    def close_current_tab(self):
+        if self.tabs.count():
+            self.close_tab(self.tabs.currentIndex())
+
+    def close_tab(self, index):
+        editor = self.tabs.widget(index)
+        if editor is None:
+            return
+        if not self._maybe_save(editor):
+            return
+        self.tabs.removeTab(index)
+        editor.deleteLater()
+        if self.tabs.count() == 0:
+            self._new_tab()  # always keep at least one tab open
+
+    # -- recent files ------------------------------------------------------ #
+
+    def _load_recent(self):
+        recent = self.settings.value("recent_files", [])
+        if recent is None:
+            recent = []
+        if isinstance(recent, str):
+            recent = [recent]
+        return [p for p in recent if p]
+
+    def _add_recent(self, path):
+        path = os.path.abspath(path)
+        self.recent_files = [p for p in self.recent_files
+                             if os.path.normcase(p) != os.path.normcase(path)]
+        self.recent_files.insert(0, path)
+        del self.recent_files[MAX_RECENT:]
+        self._rebuild_recent_menu()
+
+    def _remove_recent(self, path):
+        self.recent_files = [p for p in self.recent_files
+                             if os.path.normcase(p) != os.path.normcase(os.path.abspath(path))]
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self):
+        self.recent_menu.clear()
+        if not self.recent_files:
+            empty = self.recent_menu.addAction("(No recent files)")
+            empty.setEnabled(False)
+            return
+        for path in self.recent_files:
+            act = self.recent_menu.addAction(path)
+            act.triggered.connect(lambda _checked, p=path: self._open_path(p))
+        self.recent_menu.addSeparator()
+        clear = self.recent_menu.addAction("Clear Recent Files")
+        clear.triggered.connect(self._clear_recent)
+
+    def _clear_recent(self):
+        self.recent_files = []
+        self._rebuild_recent_menu()
 
     # -- misc -------------------------------------------------------------- #
 
@@ -997,20 +1280,32 @@ class SuPYIDE(QMainWindow):
             "<p>A lightweight Python IDE built with PyQt5.</p>"
             "<p>Made with care by <b>Sukhpreet Singh</b>.</p>")
 
+    def _save_settings(self):
+        self.settings.setValue("theme", self.current_theme)
+        self.settings.setValue("font_size", self.font_size)
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("recent_files", self.recent_files)
+
     def closeEvent(self, event):
-        if not self._maybe_save():
-            event.ignore()
-            return
+        for i in range(self.tabs.count()):
+            editor = self.tabs.widget(i)
+            if editor.document().isModified():
+                self.tabs.setCurrentIndex(i)
+                if not self._maybe_save(editor):
+                    event.ignore()
+                    return
         if self.process and self.process.state() != QProcess.NotRunning:
             self.process.kill()
             self.process.waitForFinished(1000)
         self._cleanup_temp()
+        self._save_settings()
         event.accept()
 
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("SuPY-IDE")
+    app.setOrganizationName(APP_ORG)
+    app.setApplicationName(APP_NAME)
     ide = SuPYIDE()
     ide.show()
     sys.exit(app.exec_())
